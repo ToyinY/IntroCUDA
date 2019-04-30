@@ -79,7 +79,167 @@
 
 */
 
+#include "reference_calc.cpp"
 #include "utils.h"
+#include <cstdio>
+
+__global__       
+void findMin(const float* const d_logLuminance, float* d_out, const size_t size)
+{
+    // indexing
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    
+    if(id >= size)
+    {
+        return;
+    }
+    
+    //Copy to shared memory
+    extern __shared__ float s_logLum[];
+    s_logLum[tid] = d_logLuminance[id];
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            s_logLum[tid] = min(s_logLum[tid + s],s_logLum[tid]); 
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = s_logLum[tid];
+    }
+}
+
+__global__       
+void findMax(const float* const d_logLuminance, float* d_out, const size_t size)
+{
+    // indexing
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    
+    if(id >= size)
+    {
+        return;
+    }
+    
+    //Copy to shared memory
+    extern __shared__ float s_logLum[];
+    s_logLum[tid] = d_logLuminance[id];
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            s_logLum[tid] = max(s_logLum[tid + s],s_logLum[tid]); 
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = s_logLum[tid];
+    }
+}
+
+__global__
+void generateHistogram(const float* const d_logLuminance,
+                       float min_logLum,
+                       const size_t numBins, 
+                       int* histogram,
+                       float range)
+{
+    // indexing
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // determine appropriate bin
+    int bin = (int)(((d_logLuminance[index] - min_logLum) / range) * (float)(numBins));
+
+    //increment bin count
+    atomicAdd(&(histogram[bin]), 1);
+    
+    if(bin < 16) printf("Bin = %d Count = %d\n",bin,histogram[bin]);
+}
+
+__global__
+void prefixSum(unsigned int* const out, int* in, const size_t size)
+{
+    //indexing
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    if (gid >= size)
+        return;
+        
+    //copy input array to intermediate array to start
+    extern __shared__ int s_intermediate[];
+    s_intermediate[tid] = in[gid];
+    __syncthreads();
+    
+    //copy input array to intermediate array to start
+    extern __shared__ int s_out[];
+    s_out[tid] = s_intermediate[tid];
+    __syncthreads();
+    
+    //0th value in the intermediate does not change
+    if (tid == 0)
+        out[tid] = in[tid];
+    
+    //Copy in[] to shared memory
+    extern __shared__ int s_in[];
+    s_in[tid] = in[gid];
+    __syncthreads();
+    
+    //reduce
+    for(int s = 1; s < blockDim.x; s *= 2)
+    {
+        int pos = (tid + 1) * s * 2 - 1;
+        if (pos == blockDim.x - 1)
+        {
+            s_intermediate[pos] = 0;
+            
+            //out becomes the next in for next stride
+            s_in[pos] = s_intermediate[pos];
+        } 
+        else if (pos < blockDim.x)
+        {
+            s_intermediate[pos] = s_in[pos] + s_in[pos - s];
+            
+            //out becomes the next in for next stride
+            s_in[pos] = s_intermediate[pos];
+        }
+        __syncthreads();
+    }
+    
+    //downsweep
+    for (int s = blockDim.x; s > 0; s /= 2)
+    {
+        //get new position
+        int pos = (tid + 1) * s * 2 - 1;
+        
+        if(pos < blockDim.x)
+        {
+            //swap and sum values
+            int x = s_in[pos];
+            int y = s_in[pos - s];
+            s_out[pos] = y + x; //sum
+            s_out[pos - s] = x; //swap
+            
+            //out becomce next in
+            s_intermediate[pos] = s_out[pos];
+            s_intermediate[pos - s] = s_out[pos - s];
+        }
+        __syncthreads();
+    }
+    
+    //copy back to device
+    out[gid] = s_out[tid]; //or s_out[tid] with downsweep
+    __syncthreads();
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -99,6 +259,79 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
-
-
+    
+    //threads and blocks
+    int threads = 1024; 
+    int blocks = (numCols * numRows + threads - 1) / threads;
+    printf("\nblocks = %d\nrows = %d\ncols = %d\n\n",blocks,numRows,numCols);
+    
+    //variables
+    float *d_min_array;
+    float *d_max_array;
+    float *d_min_out;
+    float *d_max_out;
+    checkCudaErrors(cudaMalloc((void **) &d_min_array, sizeof(float) * blocks));
+    checkCudaErrors(cudaMalloc((void **) &d_min_out, sizeof(float)));
+    checkCudaErrors(cudaMalloc((void **) &d_max_array, sizeof(float) * blocks));
+    checkCudaErrors(cudaMalloc((void **) &d_max_out, sizeof(float)));
+    
+    /////////////////////////////////find max//////////////////////////////////////////////
+    findMax<<<blocks, threads, threads * sizeof(float)>>>(d_logLuminance, d_max_array, numCols * numRows);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+   
+    findMax<<<1, threads, threads * sizeof(float)>>>(d_max_array, d_max_out, blocks);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+   
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_max_out, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    printf("Max = %f\n",max_logLum);
+    ///////////////////////////////////////////////////////////////////////////////////////
+    
+    /////////////////////////find min///////////////////////////////////////////////
+    findMin<<<blocks, threads, threads * sizeof(float)>>>(d_logLuminance, d_min_array, numCols * numRows);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    findMin<<<1, threads, threads * sizeof(float)>>>(d_min_array, d_min_out, blocks);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+   
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_min_out, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    printf("Min = %f\n",min_logLum);
+    ///////////////////////////////////////////////////////////////////////////////
+    
+    //////////////////////calc range////////////////////////////////////////////////////
+    float range = max_logLum - min_logLum;
+    printf("range = %f\n\n",range);
+     
+    ////////////////////////histogram//////////////////////////////////////////////////////  
+    //initialize histogram
+    int histogram[numBins];
+    for (int i = 0; i < numBins; i++)
+        histogram[i] = 0;
+        
+    printf("Bins = %d\n\n",numBins);
+        
+    int* d_histo;
+    checkCudaErrors(cudaMalloc((void **) &d_histo, numBins * sizeof(int)));
+    checkCudaErrors(cudaMemcpy(d_histo, histogram, numBins * sizeof(int), cudaMemcpyHostToDevice));
+    
+    
+    //make histogram
+    generateHistogram<<<blocks, threads>>>(d_logLuminance,
+                                           min_logLum,
+                                           numBins, 
+                                           d_histo,
+                                           range);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    ////////////////////////////////preform exclusive sum scan on histogram///////////////////////
+    blocks = (numBins + threads - 1) / threads;
+    printf("\nBlocks = %d Threads = %d\n\n",blocks,threads);
+    prefixSum<<<blocks, threads, threads * sizeof(int)>>>(d_cdf, d_histo, numBins);
+    
+    cudaFree(d_min_array);
+    cudaFree(d_max_array);
+    cudaFree(d_min_out);
+    cudaFree(d_max_out);
+    cudaFree(d_histo);
 }

@@ -26,18 +26,25 @@
 
 
 #include "utils.h"
+#include "reference.cpp"
+#include <stdio.h>
 
 __global__
 void yourHisto(const unsigned int* const vals, //INPUT
                unsigned int* const histo,      //OUPUT
                int numVals)
 {
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
-
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
+    //indexing
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (index >= numVals)
+        return;
+    
+    //increment bin
+    int bin = vals[index];
+    atomicAdd(&(histo[bin]), 1);
+    
+    /*if (bin == 119)
+        printf("Val = %d Bin = %d count = %d\n", vals[index], bin, histo[bin]);*/
 }
 
 void computeHistogram(const unsigned int* const d_vals, //INPUT
@@ -45,10 +52,29 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
                       const unsigned int numBins,
                       const unsigned int numElems)
 {
-  //TODO Launch the yourHisto kernel
-
-  //if you want to use/launch more than one kernel,
-  //feel free
-
-  cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    //Variables
+    printf("numElems = %d ", numElems);
+    printf("numBins = %d ", numBins);
+        
+    //threads and blocks
+    int blockWidth = 1024;
+    int blocks = (numElems + blockWidth - 1) / blockWidth;
+    printf("threads per block = %d ", blockWidth);
+    printf("blocks = %d\n", blocks);
+    
+    dim3 blockSize(blockWidth, 1, 1); //threads per block
+    dim3 gridSize(blocks, 1, 1); // number of blocks
+    
+    //generate histogram
+    yourHisto<<<gridSize, blockSize>>>(d_vals, d_histo, numElems);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    
+    /*//copy to host and print
+    unsigned int h_histo[numBins];
+    for (int i = 0; i < numBins; i++)
+        h_histo[i] = 0;
+    cudaMemcpy(h_histo, d_histo, sizeof(unsigned int) * numBins, cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 10; i++)
+        printf(" %d", h_histo[i]);
+    printf("\n");*/
 }
